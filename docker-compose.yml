@@ -1,25 +1,29 @@
 version: '3.8'
 
 services:
+
   postgres:
-    image: postgres:14
-    container_name: product-filter-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: todos
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
+    container_name: postgres
+    build:
+      context: ./postgres
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    command: ["postgres", "-c", "config_file=/var/lib/postgresql/postgresql.conf"]
+    env_file:
+      - .env
+    restart: on-failure
     networks:
       - app-network
+    logging:
+      driver: fluentd
+      options:
+        tag: "{{.Name}}.log"
+
   backend:
     build: 
       context: ./backend
       dockerfile: Dockerfile
-    container_name: product-filter-backend
+    container_name: backend
     restart: unless-stopped
     depends_on:
       - postgres
@@ -37,11 +41,16 @@ services:
       - /app/node_modules
     networks:
       - app-network
+    logging:
+      driver: fluentd
+      options:
+        tag: "{{.Name}}.log"
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: product-filter-frontend
+    container_name: frontend
     restart: unless-stopped
     depends_on:
       - backend
@@ -55,19 +64,216 @@ services:
       - VITE_API_BASE_URL=http://localhost:3000/api
     networks:
       - app-network
+    logging:
+      driver: fluentd
+      options:
+        tag: "{{.Name}}.log"
+
   nginx:
-    image: nginx:alpine
-    container_name: product-filter-nginx
+    # image: nginx:alpine
+    container_name: nginx
+    build:
+      context: ./nginx
     restart: unless-stopped
     ports:
       - "8080:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
     depends_on:
       - backend
       - frontend
     networks:
       - app-network
+    logging:
+      driver: fluentd
+      options:
+        tag: "{{.Name}}.log"
+    
+  # prometheus:
+  #   build:
+  #     context: ./prometheus
+  #     dockerfile: Dockerfile
+  #   container_name: product-filter-prometheus
+  #   restart: unless-stopped
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  prometheus:
+    container_name: prometheus
+    build:
+      context: ./prometheus
+    restart: on-failure
+    volumes:
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - postgres_exporter
+      - nginx_exporter
+      - node_exporter
+    networks:
+      - app-network
+
+  grafana:
+    container_name: grafana
+    build:
+      context: ./grafana
+    restart: on-failure
+    ports:
+      - "7050:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=selhano
+      - GF_SECURITY_ADMIN_PASSWORD=YourSecurePassword123!
+      # - GF_SERVER_PORT=7050
+    env_file:
+      - .env
+    networks:
+      - app-network
+
+  setup:
+    container_name: setup
+    profiles:
+      - setup
+    build:
+      context: setup/
+    init: true
+    volumes:
+      - ./setup/entrypoint.sh:/entrypoint.sh:ro
+      - ./setup/lib.sh:/lib.sh:ro
+      - ./setup/roles:/roles:ro
+    env_file:
+      - .env
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
+      KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-}
+    networks:
+      - app-network
+    depends_on:
+      - elasticsearch
+
+  elasticsearch:
+    container_name: elasticsearch
+    build:
+      context: elasticsearch/
+    volumes:
+      - ./elasticsearch/conf/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro,Z
+      - elasticsearch:/usr/share/elasticsearch/data:Z
+    ports:
+      - 9200:9200
+      - 9300:9300
+    env_file:
+      - .env
+    environment:
+      node.name: elasticsearch
+      ES_JAVA_OPTS: -Xms256m -Xmx256m
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
+      discovery.type: single-node
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  logstash:
+    container_name: logstash
+    build:
+      context: logstash/
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro,Z
+      - ./logstash/pipelines:/usr/share/logstash/pipeline:ro,Z
+    ports:
+      - 5044:5044
+      - 50000:50000/tcp
+      - 50000:50000/udp
+      - 9600:9600
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+    env_file:
+      - .env
+    networks:
+      - app-network
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  kibana:
+    container_name: kibana
+    build:
+      context: kibana/
+    volumes:
+      - ./kibana/config/kibana.yml:/usr/share/kibana/config/kibana.yml:ro,Z
+    ports:
+      - 5601:5601
+    env_file:
+      - .env
+    environment:
+      KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-}
+    networks:
+      - app-network
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  fluentd:
+    container_name: fluentd
+    build:
+      context: ./fluentd
+    restart: on-failure
+    command:
+      - /fluent-bit/bin/fluent-bit
+      - --config=/etc/fluent-bit/fluent-bit.conf
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    networks:
+      - app-network
+    env_file:
+      - .env
+    volumes:
+      - fluentbit_storage:/var/log/flb-storage:rw
+
+
+  node_exporter:
+    container_name: node_exporter
+    build:
+      context: ./node_exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /run/systemd:/run/systemd:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.rootfs=/rootfs
+      - --path.sysfs=/host/sys
+      - --collector.processes
+      - --collector.systemd
+      - --collector.filesystem
+    restart: unless-stopped
+    networks:
+      - app-network
+    pid: host
+    privileged: true
+
+  postgres_exporter:
+    container_name: postgres_exporter
+    build:
+      context: ./postgres_exporter
+    environment:
+      DATA_SOURCE_NAME: "${DATA_SOURCE_NAME}"
+    env_file:
+      - .env
+    restart: on-failure
+    networks:
+      - app-network
+
+  nginx_exporter:
+    container_name: nginx_exporter
+    build:
+      context: ./nginx_exporter
+    networks:
+      - app-network
+    restart: on-failure
+    command:
+      - --nginx.scrape-uri=http://nginx:80/stub_status
 
 networks:
   app-network:
@@ -75,3 +281,6 @@ networks:
 
 volumes:
   postgres_data:
+  elasticsearch:
+  fluentbit_storage:
+  prometheus_data:

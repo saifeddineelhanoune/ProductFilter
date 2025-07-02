@@ -1,5 +1,6 @@
 all:
 	docker-compose up --build
+	docker-c
 
 stop:
 	docker-compose down
